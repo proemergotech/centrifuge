@@ -127,6 +127,8 @@ type Client struct {
 	disconnect *Disconnect
 
 	eventHub *ClientEventHub
+
+	subscribeHandler subscribeHandler
 }
 
 // newClient creates new client connection.
@@ -142,6 +144,11 @@ func newClient(ctx context.Context, n *Node, t transport) (*Client, error) {
 		transport: t,
 		eventHub:  &ClientEventHub{},
 	}
+
+	c.addSubscribeMiddleware(c.MainChannelSubscribeMiddleware)
+	c.addSubscribeMiddleware(c.AlreadySubscribedMiddleware)
+	c.addSubscribeMiddleware(c.ChannelLimitMiddleware)
+	c.addSubscribeMiddleware(c.ChannelMaxLengthMiddleware)
 
 	config := n.Config()
 	staleCloseDelay := config.ClientStaleCloseDelay
@@ -1155,29 +1162,53 @@ func (c *Client) refreshCmd(cmd *proto.RefreshRequest) (*proto.RefreshResponse, 
 // actually subscribe client on channel. Optionally we can send missed messages to
 // client if it provided last message id seen in channel.
 func (c *Client) subscribeCmd(cmd *proto.SubscribeRequest) (*proto.SubscribeResponse, *Disconnect) {
-
 	channel := cmd.Channel
 	if channel == "" {
 		c.node.logger.log(newLogEntry(LogLevelInfo, "channel required for subscribe", map[string]interface{}{"user": c.user, "client": c.uid}))
 		return nil, DisconnectBadRequest
 	}
 
-	resp := &proto.SubscribeResponse{}
+	res, err, disc := c.subscribeHandler(cmd, nil)
+	if err != nil {
+		return &proto.SubscribeResponse{Error: err}, nil
+	}
+	if disc != nil {
+		return nil, disc
+	}
 
-	config := c.node.Config()
+	return &proto.SubscribeResponse{Result: res}, nil
+}
 
-	secret := config.Secret
-	channelMaxLength := config.ChannelMaxLength
-	channelLimit := config.ClientChannelLimit
-	insecure := config.ClientInsecure
+type subscribeHandler func(cmd *proto.SubscribeRequest, channelInfo Raw) (*proto.SubscribeResult, *Error, *Disconnect)
 
-	res := &proto.SubscribeResult{}
+type susbcribeMiddleware func(cmd *proto.SubscribeRequest, channelInfo Raw, next subscribeHandler) (*proto.SubscribeResult, *Error, *Disconnect)
+
+func (c *Client) addSubscribeMiddleware(m susbcribeMiddleware) {
+	oldHandler := c.subscribeHandler
+
+	c.subscribeHandler = func(cmd *proto.SubscribeRequest, channelInfo Raw) (*proto.SubscribeResult, *Error, *Disconnect) {
+		return m(cmd, channelInfo, oldHandler)
+	}
+}
+
+func (c *Client) ChannelMaxLengthMiddleware(cmd *proto.SubscribeRequest, channelInfo Raw, next subscribeHandler) (res *proto.SubscribeResult, err *Error, disc *Disconnect) {
+	c.node.logger.log(newLogEntry(LogLevelDebug, "ChannelMaxLengthMiddleware called"))
+
+	channel := cmd.Channel
+	channelMaxLength := c.node.config.ChannelMaxLength
 
 	if channelMaxLength > 0 && len(channel) > channelMaxLength {
 		c.node.logger.log(newLogEntry(LogLevelInfo, "channel too long", map[string]interface{}{"max": channelMaxLength, "channel": channel, "user": c.user, "client": c.uid}))
-		resp.Error = ErrorLimitExceeded
-		return resp, nil
+		return nil, err, nil
 	}
+
+	return next(cmd, channelInfo)
+}
+
+func (c *Client) ChannelLimitMiddleware(cmd *proto.SubscribeRequest, channelInfo Raw, next subscribeHandler) (res *proto.SubscribeResult, err *Error, disc *Disconnect) {
+	c.node.logger.log(newLogEntry(LogLevelDebug, "ChannelLimitMiddleware called"))
+
+	channelLimit := c.node.config.ClientChannelLimit
 
 	c.mu.RLock()
 	numChannels := len(c.channels)
@@ -1185,9 +1216,16 @@ func (c *Client) subscribeCmd(cmd *proto.SubscribeRequest) (*proto.SubscribeResp
 
 	if channelLimit > 0 && numChannels >= channelLimit {
 		c.node.logger.log(newLogEntry(LogLevelInfo, "maximum limit of channels per client reached", map[string]interface{}{"limit": channelLimit, "user": c.user, "client": c.uid}))
-		resp.Error = ErrorLimitExceeded
-		return resp, nil
+		return nil, ErrorLimitExceeded, nil
 	}
+
+	return next(cmd, channelInfo)
+}
+
+func (c *Client) AlreadySubscribedMiddleware(cmd *proto.SubscribeRequest, channelInfo Raw, next subscribeHandler) (res *proto.SubscribeResult, err *Error, disc *Disconnect) {
+	c.node.logger.log(newLogEntry(LogLevelDebug, "AlreadySubscribedMiddleware called"))
+
+	channel := cmd.Channel
 
 	c.mu.RLock()
 	_, ok := c.channels[channel]
@@ -1195,29 +1233,35 @@ func (c *Client) subscribeCmd(cmd *proto.SubscribeRequest) (*proto.SubscribeResp
 
 	if ok {
 		c.node.logger.log(newLogEntry(LogLevelInfo, "client already subscribed on channel", map[string]interface{}{"channel": channel, "user": c.user, "client": c.uid}))
-		resp.Error = ErrorAlreadySubscribed
-		return resp, nil
+		return nil, ErrorAlreadySubscribed, nil
 	}
+
+	return next(cmd, channelInfo)
+}
+
+func (c *Client) MainChannelSubscribeMiddleware(cmd *proto.SubscribeRequest, channelInfo Raw, next subscribeHandler) (*proto.SubscribeResult, *Error, *Disconnect) {
+	c.node.logger.log(newLogEntry(LogLevelDebug, "MainChannelSubscribeMiddleware called"))
+
+	channel := cmd.Channel
+	config := c.node.config
+	secret := config.Secret
+	insecure := config.ClientInsecure
 
 	if !c.node.userAllowed(channel, c.user) {
 		c.node.logger.log(newLogEntry(LogLevelInfo, "user is not allowed to subscribe on channel", map[string]interface{}{"channel": channel, "user": c.user, "client": c.uid}))
-		resp.Error = ErrorPermissionDenied
-		return resp, nil
+		return nil, ErrorPermissionDenied, nil
 	}
 
 	chOpts, ok := c.node.ChannelOpts(channel)
 	if !ok {
-		resp.Error = ErrorNamespaceNotFound
-		return resp, nil
+		return nil, ErrorNamespaceNotFound, nil
 	}
 
 	if !chOpts.Anonymous && c.user == "" && !insecure {
 		c.node.logger.log(newLogEntry(LogLevelInfo, "anonymous user is not allowed to subscribe on channel", map[string]interface{}{"channel": channel, "user": c.user, "client": c.uid}))
-		resp.Error = ErrorPermissionDenied
-		return resp, nil
+		return nil, ErrorPermissionDenied, nil
 	}
 
-	var channelInfo proto.Raw
 	var expireAt int64
 
 	isPrivateChannel := c.node.privateChannel(channel)
@@ -1240,8 +1284,7 @@ func (c *Client) subscribeCmd(cmd *proto.SubscribeRequest) (*proto.SubscribeResp
 		})
 		if parsedToken == nil && err != nil {
 			c.node.logger.log(newLogEntry(LogLevelInfo, "invalid subscription token", map[string]interface{}{"error": err.Error(), "client": c.uid, "user": c.UserID()}))
-			resp.Error = ErrorPermissionDenied
-			return resp, nil
+			return nil, ErrorPermissionDenied, nil
 		}
 		if claims, ok := parsedToken.Claims.(*subscribeTokenClaims); ok && parsedToken.Valid {
 			tokenChannel = claims.Channel
@@ -1251,12 +1294,10 @@ func (c *Client) subscribeCmd(cmd *proto.SubscribeRequest) (*proto.SubscribeResp
 			expireAt = claims.StandardClaims.ExpiresAt
 
 			if c.uid != tokenClient {
-				resp.Error = ErrorPermissionDenied
-				return resp, nil
+				return nil, ErrorPermissionDenied, nil
 			}
 			if cmd.Channel != tokenChannel {
-				resp.Error = ErrorPermissionDenied
-				return resp, nil
+				return nil, ErrorPermissionDenied, nil
 			}
 
 			if len(tokenInfo) > 0 {
@@ -1267,7 +1308,7 @@ func (c *Client) subscribeCmd(cmd *proto.SubscribeRequest) (*proto.SubscribeResp
 				byteInfo, err := base64.StdEncoding.DecodeString(tokenB64info)
 				if err != nil {
 					c.node.logger.log(newLogEntry(LogLevelInfo, "can not decode provided info from base64", map[string]interface{}{"user": c.UserID(), "client": c.uid, "error": err.Error()}))
-					return resp, DisconnectBadRequest
+					return nil, nil, DisconnectBadRequest
 				}
 				channelInfo = byteInfo
 			}
@@ -1275,16 +1316,13 @@ func (c *Client) subscribeCmd(cmd *proto.SubscribeRequest) (*proto.SubscribeResp
 			if validationErr, ok := err.(*jwt.ValidationError); ok {
 				if validationErr.Errors == jwt.ValidationErrorExpired {
 					// The only problem with token is its expiration - no other errors set in bitfield.
-					resp.Error = ErrorTokenExpired
-					return resp, nil
+					return nil, ErrorTokenExpired, nil
 				}
 				c.node.logger.log(newLogEntry(LogLevelInfo, "invalid subscription token", map[string]interface{}{"error": err.Error(), "client": c.uid, "user": c.UserID()}))
-				resp.Error = ErrorPermissionDenied
-				return resp, nil
+				return nil, ErrorPermissionDenied, nil
 			}
 			c.node.logger.log(newLogEntry(LogLevelInfo, "invalid subscription token", map[string]interface{}{"error": err.Error(), "client": c.uid, "user": c.UserID()}))
-			resp.Error = ErrorPermissionDenied
-			return resp, nil
+			return nil, ErrorPermissionDenied, nil
 		}
 	}
 
@@ -1293,11 +1331,10 @@ func (c *Client) subscribeCmd(cmd *proto.SubscribeRequest) (*proto.SubscribeResp
 			Channel: channel,
 		})
 		if reply.Disconnect != nil {
-			return resp, reply.Disconnect
+			return nil, nil, reply.Disconnect
 		}
 		if reply.Error != nil {
-			resp.Error = reply.Error
-			return resp, nil
+			return nil, reply.Error, nil
 		}
 		if len(reply.ChannelInfo) > 0 && !isPrivateChannel {
 			channelInfo = reply.ChannelInfo
@@ -1307,12 +1344,13 @@ func (c *Client) subscribeCmd(cmd *proto.SubscribeRequest) (*proto.SubscribeResp
 		}
 	}
 
+	res := &proto.SubscribeResult{}
+
 	if expireAt > 0 {
 		now := time.Now().Unix()
 		if expireAt < now {
 			c.node.logger.log(newLogEntry(LogLevelInfo, "subscription expiration must be greater than now", map[string]interface{}{"client": c.uid, "user": c.UserID()}))
-			resp.Error = ErrorExpired
-			return resp, nil
+			return nil, ErrorExpired, nil
 		}
 		if isPrivateChannel {
 			// Only expose expiration info to client in private channel case.
@@ -1334,7 +1372,7 @@ func (c *Client) subscribeCmd(cmd *proto.SubscribeRequest) (*proto.SubscribeResp
 	err := c.node.addSubscription(channel, c)
 	if err != nil {
 		c.node.logger.log(newLogEntry(LogLevelError, "error adding subscription", map[string]interface{}{"channel": channel, "user": c.user, "client": c.uid, "error": err.Error()}))
-		return nil, DisconnectServerError
+		return nil, nil, DisconnectServerError
 	}
 
 	c.mu.RLock()
@@ -1345,7 +1383,7 @@ func (c *Client) subscribeCmd(cmd *proto.SubscribeRequest) (*proto.SubscribeResp
 		err = c.node.addPresence(channel, c.uid, info)
 		if err != nil {
 			c.node.logger.log(newLogEntry(LogLevelError, "error adding presence", map[string]interface{}{"channel": channel, "user": c.user, "client": c.uid, "error": err.Error()}))
-			return nil, DisconnectServerError
+			return nil, nil, DisconnectServerError
 		}
 	}
 
@@ -1397,8 +1435,8 @@ func (c *Client) subscribeCmd(cmd *proto.SubscribeRequest) (*proto.SubscribeResp
 		}
 		go c.node.publishJoin(channel, join, &chOpts)
 	}
-	resp.Result = res
-	return resp, nil
+
+	return res, nil, nil
 }
 
 func (c *Client) subRefreshCmd(cmd *proto.SubRefreshRequest) (*proto.SubRefreshResponse, *Disconnect) {
